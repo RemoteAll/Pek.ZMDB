@@ -1096,3 +1096,75 @@ test "热加载：reloadAll 遍历已加载表并返回重载数" {
     defer mem.deinit();
     try testing.expectEqual(@as(usize, 0), try mem.reloadAll());
 }
+
+test "热加载审计：内存删除且文件未改 → 保持删除并回写文件" {
+    var temp = try TempDb.init(.{ .auto_persist = false });
+    defer temp.deinit();
+
+    const id1 = try insertUser(&temp.db, 1);
+    const id2 = try insertUser(&temp.db, 2);
+    try temp.db.flush();
+    const path = try temp.dataFile(User);
+    defer gpa.free(path);
+
+    // 内存删除 user2
+    try testing.expect(try temp.db.delete(User, id2));
+
+    // 外部只改 user1（触发热加载）；user2 行仍在文件里且未改
+    const original = try readText(path);
+    defer gpa.free(original);
+    const patched = try std.mem.replaceOwned(u8, gpa, original, "user1@example.com", "kick@example.com");
+    defer gpa.free(patched);
+    try zmdb.persist.writeFileAtomic(io, gpa, path, patched);
+
+    try testing.expect(try temp.db.reload(User));
+    try testing.expect((try temp.db.findById(User, id2)) == null);
+
+    const one = (try temp.db.findById(User, id1)).?;
+    defer one.release();
+    try testing.expectEqualStrings("kick@example.com", one.get().email);
+
+    // 内存删除尚未进入文件：必须标记脏并回写，否则下次加载会复活被删行
+    const table = try temp.db.tableOf(User);
+    try testing.expect(table.isDirty());
+    try temp.db.flush();
+
+    const after = try readText(path);
+    defer gpa.free(after);
+    try testing.expect(std.mem.indexOf(u8, after, "user2") == null);
+}
+
+test "热加载审计：内存删除且文件也删除 → 无需回写" {
+    var temp = try TempDb.init(.{ .auto_persist = false });
+    defer temp.deinit();
+
+    _ = try insertUser(&temp.db, 1);
+    const id2 = try insertUser(&temp.db, 2);
+    try temp.db.flush();
+    const path = try temp.dataFile(User);
+    defer gpa.free(path);
+
+    try testing.expect(try temp.db.delete(User, id2));
+
+    // 文件也删掉 id2：只保留 id1 那一行
+    const original = try readText(path);
+    defer gpa.free(original);
+    var kept_line: []const u8 = "";
+    var lines = std.mem.splitScalar(u8, original, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.indexOf(u8, line, "Id:1,") != null) {
+            kept_line = std.mem.trim(u8, line, " \t\r,");
+        }
+    }
+    try testing.expect(kept_line.len > 0);
+    const only_first = try std.fmt.allocPrint(gpa, "[\r\n\t{s}\r\n]", .{kept_line});
+    defer gpa.free(only_first);
+    try zmdb.persist.writeFileAtomic(io, gpa, path, only_first);
+
+    // 内存与文件已一致（删的行文件里也没有）→ 不产生变更，也无需再写盘
+    try testing.expect(!try temp.db.reload(User));
+    try testing.expect((try temp.db.findById(User, id2)) == null);
+
+    const table = try temp.db.tableOf(User);
+    try testing.expect(!table.isDirty());
+}

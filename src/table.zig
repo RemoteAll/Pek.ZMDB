@@ -618,7 +618,9 @@ pub fn Table(comptime T: type) type {
             const now_ns = std.Io.Timestamp.now(self.io, .awake).nanoseconds;
             const now_ms: i64 = @intCast(@divTrunc(now_ns, std.time.ns_per_ms));
             const last_ms = self.last_reload_check_ms.load(.monotonic);
-            if (last_ms != 0 and now_ms - last_ms < @as(i64, @intCast(interval_ms))) return false;
+            const interval: i64 = @intCast(interval_ms);
+            // 系统时钟回拨时 `now_ms < last_ms`：不要当成「刚检查过」而永久跳过
+            if (last_ms != 0 and now_ms >= last_ms and now_ms - last_ms < interval) return false;
             self.last_reload_check_ms.store(now_ms, .monotonic);
             return true;
         }
@@ -744,6 +746,8 @@ pub fn Table(comptime T: type) type {
             var kept: usize = 0;
             var conflicts: usize = 0;
             var removed: usize = 0;
+            // 合并结果与文件不一致（内存独有修改或内存删除仍需回写文件）
+            var needs_write = false;
 
             for (mem_ids) |id| {
                 const box = self.by_id.get(id) orelse continue;
@@ -760,6 +764,7 @@ pub fn Table(comptime T: type) type {
                             }
                         } else if (row.hash == base_hash) {
                             kept += 1; // 只有内存改 → 保留
+                            needs_write = true;
                         } else if (mem_hash == row.hash) {
                             // 两边改成一样，无需动作
                         } else {
@@ -777,15 +782,15 @@ pub fn Table(comptime T: type) type {
                 // 文件里没有该行
                 if (base == null) {
                     kept += 1; // 内存新增（未同步）
+                    needs_write = true;
                     continue;
                 }
+                // 保留 `synced` 基准：未写盘前再次热加载时仍需判断「文件是否改过该行」
                 if (mem_hash == base.?) {
                     if (self.deleteLocked(id)) removed += 1; // 内存未改、文件已删除
-                    _ = self.synced.remove(id);
                 } else {
                     conflicts += 1; // 内存改 / 文件删 → 文件优先
                     if (self.deleteLocked(id)) removed += 1;
-                    _ = self.synced.remove(id);
                 }
             }
 
@@ -796,17 +801,21 @@ pub fn Table(comptime T: type) type {
                 if (self.by_id.contains(id)) continue;
                 const row = &file_rows.items[entry.value_ptr.*];
                 if (self.synced.get(id)) |base_hash| {
-                    if (row.hash == base_hash) continue; // 文件未改且内存已删除 → 保持删除
+                    if (row.hash == base_hash) {
+                        // 文件未改且内存已删除 → 保持删除；但文件里仍有该行，必须回写才不回生
+                        needs_write = true;
+                        continue;
+                    }
                     conflicts += 1; // 内存删 / 文件改 → 文件优先（恢复）
                 }
                 if (try self.applyFileRowLocked(row)) adopted += 1;
             }
 
             self.file_sig = sig;
-            // 保留了内存独有改动 → 需要把合并结果写回文件
-            self.dirty.store(kept > 0, .release);
+            // 内存独有改动 / 内存删除尚未与文件一致 → 标记脏，后台线程会把合并结果写回文件
+            self.dirty.store(needs_write, .release);
 
-            if (adopted + kept + conflicts + removed == 0) return false;
+            if (adopted + kept + conflicts + removed == 0 and !needs_write) return false;
             log.info(
                 "热加载 {s}（合并）：采用文件 {d} / 保留内存 {d} / 冲突取文件 {d} / 删除 {d}（数据文件 {s}）",
                 .{ self.type_name, adopted, kept, conflicts, removed, path },

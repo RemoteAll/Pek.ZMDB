@@ -450,7 +450,9 @@ pub const MemoryDb = struct {
         const table = try self.tableFor(T);
         const path = (try self.dataFilePath(T)) orelse return false;
         defer self.inner.gpa.free(path);
-        return table.reloadIfChanged(path);
+        const changed = try table.reloadIfChanged(path);
+        if (changed and table.isDirty()) self.inner.hub.notify(self.inner.io);
+        return changed;
     }
 
     /// 检查全部已加载表（返回发生重载的表数）。
@@ -480,7 +482,10 @@ pub const MemoryDb = struct {
                 log.warn("热加载 {s} 失败：{s}；保留内存数据", .{ any.type_name, @errorName(err) });
                 continue;
             };
-            if (changed) reloaded += 1;
+            if (changed) {
+                reloaded += 1;
+                if (any.vtable.isDirty(any.ptr)) inner.hub.notify(inner.io);
+            }
         }
         return reloaded;
     }
@@ -493,10 +498,11 @@ pub const MemoryDb = struct {
         if (!table.shouldCheckReload(interval)) return table;
         const path = (try self.dataFilePath(T)) orelse return table;
         defer self.inner.gpa.free(path);
-        _ = table.reloadIfChanged(path) catch |err| {
+        const changed = table.reloadIfChanged(path) catch |err| {
             log.warn("读 {s} 前热加载失败：{s}；继续使用内存数据", .{ entity.typeName(T), @errorName(err) });
             return table;
         };
+        if (changed and table.isDirty()) self.inner.hub.notify(self.inner.io);
         return table;
     }
 

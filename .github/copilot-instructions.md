@@ -46,7 +46,7 @@ zig fmt --check build.zig src examples      # 格式
 powershell -NoProfile -ExecutionPolicy Bypass -File tools\regression.ps1   # 一键回归：fmt → Debug → ReleaseFast → 示例
 ```
 
-当前基线：**66 个测试全部通过**。改持久化/索引/唯一约束/删除/热加载后必须重跑 `tools/regression.ps1`，
+当前基线：**68 个测试全部通过**。改持久化/索引/唯一约束/删除/热加载后必须重跑 `tools/regression.ps1`，
 性能相关改动还要贴 `bench` 前后实测数字（见 `docs/决策记录.md` 2026-11-27 节）。
 
 ## 每轮收尾（务必）
