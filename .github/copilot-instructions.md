@@ -18,6 +18,9 @@
 - **所有权**：`insert`/`update`/`insertBatch` **失败时由库 `deinit` 传入实体**，成功后归库；
   查询返回 `Ref`/`List`/`Page`，调用方必须 `release`/`deinit`（测试用 `std.testing.allocator` 抓泄漏）。
 - **并发**：每表一把 `std.Io.RwLock`；实体 `Ref` 原子引用计数（删后延迟释放）；`io` 必须是线程安全实现（`std.Io.Threaded`）。
+- **大小写口径（与 C# 对齐，勿随意放宽）**：字段名严格（`Id`/`Name` 亦严格）；文本精确 / 唯一约束**区分**大小写；
+  Like / Range **不区分**（仅 ASCII 折叠）。已知边界：非 ASCII 不折叠、空串会进文本索引、加载 JSON 键名容忍大小写。
+  细节与行号见 `docs/与C#对照.md` §3 / §8。
 - **zzig 已踩坑**：`fsio.writeFileAtomic` 不在写 `.tmp` 前建父目录 → 本项目 `persist.writeFileAtomic` 先 `ensureParent`；
   `zzig.json.Jsmn` 不支持裸键；`zzig.glob.matchPattern` 是路径语义（不能用于字段值通配）。
 - **Zig 0.17 已踩坑**：std 无 `BTreeMap`/`Treap`、无 `std.Thread.Mutex`（锁/条件变量在 `std.Io`）；
