@@ -968,3 +968,131 @@ test "并发：多线程按主键读取" {
     }
     for (&threads) |thread| thread.join();
 }
+
+// ----------------------------------------------------------------------
+// 双向热更新（文件 ⇄ 内存）
+// ----------------------------------------------------------------------
+
+test "热加载合并：内存独有保留、文件独有采用、冲突取文件" {
+    var temp = try TempDb.init(.{ .auto_persist = false });
+    defer temp.deinit();
+
+    const id1 = try insertUser(&temp.db, 1);
+    const id2 = try insertUser(&temp.db, 2);
+    const id3 = try insertUser(&temp.db, 3);
+    try temp.db.flush();
+    const path = try temp.dataFile(User);
+    defer gpa.free(path);
+
+    // 内存修改：user1（文件不改）、user3（文件也改 → 冲突）
+    for ([_]i64{ id1, id3 }) |id| {
+        const ref = (try temp.db.findById(User, id)).?;
+        var copy = try ref.get().clone(gpa);
+        ref.release();
+        gpa.free(copy.status);
+        copy.status = try gpa.dupe(u8, "MemOnly");
+        try temp.db.update(User, copy, null);
+    }
+
+    // 文件修改：user2（内存不改）、user3（冲突）
+    const original = try readText(path);
+    defer gpa.free(original);
+    const with2 = try std.mem.replaceOwned(u8, gpa, original, "user2@example.com", "user2-new@example.com");
+    defer gpa.free(with2);
+    const patched = try std.mem.replaceOwned(u8, gpa, with2, "user3@example.com", "user3-new@example.com");
+    defer gpa.free(patched);
+    try zmdb.persist.writeFileAtomic(io, gpa, path, patched);
+
+    try testing.expect(try temp.db.reload(User));
+
+    // 只有内存改 → 保留内存
+    const one = (try temp.db.findById(User, id1)).?;
+    defer one.release();
+    try testing.expectEqualStrings("MemOnly", one.get().status);
+    try testing.expectEqualStrings("user1@example.com", one.get().email);
+
+    // 只有文件改 → 采用文件
+    const two = (try temp.db.findById(User, id2)).?;
+    defer two.release();
+    try testing.expectEqualStrings("user2-new@example.com", two.get().email);
+
+    // 两边都改 → 文件优先
+    const three = (try temp.db.findById(User, id3)).?;
+    defer three.release();
+    try testing.expectEqualStrings("user3-new@example.com", three.get().email);
+    try testing.expectEqualStrings("Disabled", three.get().status);
+
+    // 签名已更新：未再变化不重复解析
+    try testing.expect(!try temp.db.reload(User));
+
+    // 合并结果写回文件：内存独有改动不丢
+    try temp.db.flush();
+    const merged = try readText(path);
+    defer gpa.free(merged);
+    try testing.expect(std.mem.indexOf(u8, merged, "MemOnly") != null);
+    try testing.expect(std.mem.indexOf(u8, merged, "user2-new@example.com") != null);
+}
+
+test "热加载：文件损坏时保留内存数据" {
+    var temp = try TempDb.init(.{ .auto_persist = false });
+    defer temp.deinit();
+
+    const id = try insertUser(&temp.db, 1);
+    try temp.db.flush();
+    const path = try temp.dataFile(User);
+    defer gpa.free(path);
+
+    try zmdb.persist.writeFileAtomic(io, gpa, path, "{ oops");
+    try testing.expectError(error.PersistError, temp.db.reload(User));
+
+    const ref = (try temp.db.findById(User, id)).?;
+    defer ref.release();
+    try testing.expectEqualStrings("user1", ref.get().username);
+}
+
+test "热加载：读入口按间隔自动检查文件变化" {
+    var temp = try TempDb.init(.{ .auto_persist = false, .reload_on_read_interval_ms = 1 });
+    defer temp.deinit();
+
+    const id = try insertUser(&temp.db, 1);
+    try temp.db.flush();
+    const path = try temp.dataFile(User);
+    defer gpa.free(path);
+
+    const original = try readText(path);
+    defer gpa.free(original);
+    const patched = try std.mem.replaceOwned(u8, gpa, original, "user1@example.com", "auto@example.com");
+    defer gpa.free(patched);
+    try zmdb.persist.writeFileAtomic(io, gpa, path, patched);
+
+    // 过掉节流窗口（1ms）
+    io.sleep(.{ .nanoseconds = 2 * std.time.ns_per_ms }, .awake) catch {};
+
+    const ref = (try temp.db.findById(User, id)).?;
+    defer ref.release();
+    try testing.expectEqualStrings("auto@example.com", ref.get().email);
+}
+
+test "热加载：reloadAll 遍历已加载表并返回重载数" {
+    var temp = try TempDb.init(.{ .auto_persist = false });
+    defer temp.deinit();
+
+    _ = try insertUser(&temp.db, 1);
+    try temp.db.flush();
+    const path = try temp.dataFile(User);
+    defer gpa.free(path);
+
+    const original = try readText(path);
+    defer gpa.free(original);
+    const patched = try std.mem.replaceOwned(u8, gpa, original, "user1@example.com", "all@example.com");
+    defer gpa.free(patched);
+    try zmdb.persist.writeFileAtomic(io, gpa, path, patched);
+
+    try testing.expectEqual(@as(usize, 1), try temp.db.reloadAll());
+    try testing.expectEqual(@as(usize, 0), try temp.db.reloadAll());
+
+    // 纯内存实例没有数据文件：返回 0，不报错
+    var mem = try memoryDb();
+    defer mem.deinit();
+    try testing.expectEqual(@as(usize, 0), try mem.reloadAll());
+}

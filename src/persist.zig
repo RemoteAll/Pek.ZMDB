@@ -136,6 +136,27 @@ pub fn readFileAlloc(
     };
 }
 
+/// 文件签名（mtime + 大小）：热加载的**变化驱动**判据。
+///
+/// 只做一次 `stat`（不读内容、不解析）；签名相同即认为文件未变。
+pub const FileSignature = struct {
+    mtime_ns: i96 = 0,
+    size: u64 = 0,
+
+    pub fn eql(a: FileSignature, b: FileSignature) bool {
+        return a.mtime_ns == b.mtime_ns and a.size == b.size;
+    }
+
+    /// 读取文件签名（文件不存在返回 `null`；其它错误向上抛）。
+    pub fn ofFile(io: std.Io, path: []const u8) !?FileSignature {
+        const stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
+        return .{ .mtime_ns = stat.mtime.nanoseconds, .size = stat.size };
+    }
+};
+
 // ----------------------------------------------------------------------
 // 测试
 // ----------------------------------------------------------------------

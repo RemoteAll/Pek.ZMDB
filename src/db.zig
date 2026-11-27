@@ -47,6 +47,10 @@ pub const DbOptions = struct {
     pretty: bool = true,
     /// `MemoryDb.deinit` 时是否同步写盘（默认 `true`，避免丢尾部修改）。
     flush_on_drop: bool = true,
+    /// 读操作前检查数据文件是否被外部修改并热加载（**毫秒**；`0` = 关闭，默认）。
+    ///
+    /// 开启后每次读最多每 N 毫秒做一次 `stat`（变化驱动 + 节流，不轮询、不整表重读）。
+    reload_on_read_interval_ms: u64 = 0,
 };
 
 /// 内存数据库实例。
@@ -288,12 +292,12 @@ pub const MemoryDb = struct {
     // ------------------------------------------------------------------
 
     pub fn findById(self: *MemoryDb, comptime T: type, id: i64) Error!?entity.Ref(T) {
-        const table = try self.tableFor(T);
+        const table = try self.tableForRead(T);
         return table.findById(id);
     }
 
     pub fn findAll(self: *MemoryDb, comptime T: type) Error!entity.List(T) {
-        const table = try self.tableFor(T);
+        const table = try self.tableForRead(T);
         return table.findAll() catch |err| return mapAlloc(err);
     }
 
@@ -303,7 +307,7 @@ pub const MemoryDb = struct {
         field: []const u8,
         input: model.Value,
     ) Error!entity.List(T) {
-        const table = try self.tableFor(T);
+        const table = try self.tableForRead(T);
         return table.findBy(field, input) catch |err| return mapAlloc(err);
     }
 
@@ -314,12 +318,12 @@ pub const MemoryDb = struct {
         min_input: model.Value,
         max_input: model.Value,
     ) Error!entity.List(T) {
-        const table = try self.tableFor(T);
+        const table = try self.tableForRead(T);
         return table.findByRange(field, min_input, max_input) catch |err| return mapAlloc(err);
     }
 
     pub fn findByLike(self: *MemoryDb, comptime T: type, field: []const u8, pattern: []const u8) Error!entity.List(T) {
-        const table = try self.tableFor(T);
+        const table = try self.tableForRead(T);
         return table.findByLike(field, pattern) catch |err| return mapAlloc(err);
     }
 
@@ -328,7 +332,7 @@ pub const MemoryDb = struct {
         comptime T: type,
         conditions: []const model.Condition,
     ) Error!entity.List(T) {
-        const table = try self.tableFor(T);
+        const table = try self.tableForRead(T);
         return table.findByMultiple(conditions) catch |err| return mapAlloc(err);
     }
 
@@ -340,7 +344,7 @@ pub const MemoryDb = struct {
         page_size: usize,
         ascending: bool,
     ) Error!entity.Page(T) {
-        const table = try self.tableFor(T);
+        const table = try self.tableForRead(T);
         return table.findByPage(sort_field, page_index, page_size, ascending) catch |err| return mapAlloc(err);
     }
 
@@ -350,7 +354,7 @@ pub const MemoryDb = struct {
         field: []const u8,
         input: model.Value,
     ) Error!?entity.Ref(T) {
-        const table = try self.tableFor(T);
+        const table = try self.tableForRead(T);
         return table.findByUnique(field, input);
     }
 
@@ -360,7 +364,7 @@ pub const MemoryDb = struct {
         group: []const u8,
         inputs: []const model.Condition,
     ) Error!?entity.Ref(T) {
-        const table = try self.tableFor(T);
+        const table = try self.tableForRead(T);
         return table.findByCompositeUnique(group, inputs);
     }
 
@@ -371,7 +375,7 @@ pub const MemoryDb = struct {
         input: model.Value,
         exclude_id: ?i64,
     ) Error!bool {
-        const table = try self.tableFor(T);
+        const table = try self.tableForRead(T);
         return table.isUniqueValueExists(field, input, exclude_id);
     }
 
@@ -437,6 +441,63 @@ pub const MemoryDb = struct {
         if (self.inner.base_dir.len == 0) return null;
         return persist.tablePathAlloc(self.inner.gpa, self.inner.base_dir, entity.typeName(T)) catch
             error.OutOfMemory;
+    }
+
+    /// 热加载指定表（**文件优先**）：数据文件被外部修改时以文件内容重建整表。
+    ///
+    /// 返回 `true` 表示发生了重载；签名未变 / 文件不存在 / 纯内存实例返回 `false`。
+    pub fn reload(self: *MemoryDb, comptime T: type) Error!bool {
+        const table = try self.tableFor(T);
+        const path = (try self.dataFilePath(T)) orelse return false;
+        defer self.inner.gpa.free(path);
+        return table.reloadIfChanged(path);
+    }
+
+    /// 检查全部已加载表（返回发生重载的表数）。
+    pub fn reloadAll(self: *MemoryDb) Error!usize {
+        const inner = self.inner;
+        if (inner.base_dir.len == 0) return 0;
+
+        var list: std.ArrayList(table_mod.AnyTable) = .empty;
+        defer list.deinit(inner.gpa);
+
+        inner.tables_lock.lockSharedUncancelable(inner.io);
+        {
+            var iterator = inner.tables.valueIterator();
+            while (iterator.next()) |any| list.append(inner.gpa, any.*) catch {
+                inner.tables_lock.unlockShared(inner.io);
+                return error.OutOfMemory;
+            };
+        }
+        inner.tables_lock.unlockShared(inner.io);
+
+        var reloaded: usize = 0;
+        for (list.items) |any| {
+            const path = persist.tablePathAlloc(inner.gpa, inner.base_dir, any.type_name) catch
+                return error.OutOfMemory;
+            defer inner.gpa.free(path);
+            const changed = any.vtable.reloadIfChanged(any.ptr, path) catch |err| {
+                log.warn("热加载 {s} 失败：{s}；保留内存数据", .{ any.type_name, @errorName(err) });
+                continue;
+            };
+            if (changed) reloaded += 1;
+        }
+        return reloaded;
+    }
+
+    /// 读入口：按 `reload_on_read_interval_ms` 节流检查文件变化（默认关闭）。
+    fn tableForRead(self: *MemoryDb, comptime T: type) Error!*table_mod.Table(T) {
+        const table = try self.tableFor(T);
+        const interval = self.inner.options.reload_on_read_interval_ms;
+        if (interval == 0 or self.inner.base_dir.len == 0) return table;
+        if (!table.shouldCheckReload(interval)) return table;
+        const path = (try self.dataFilePath(T)) orelse return table;
+        defer self.inner.gpa.free(path);
+        _ = table.reloadIfChanged(path) catch |err| {
+            log.warn("读 {s} 前热加载失败：{s}；继续使用内存数据", .{ entity.typeName(T), @errorName(err) });
+            return table;
+        };
+        return table;
     }
 
     fn tableFor(self: *MemoryDb, comptime T: type) Error!*table_mod.Table(T) {
@@ -640,4 +701,14 @@ pub fn isUniqueValueExists(
 
 pub fn statistics(gpa: std.mem.Allocator) Error!DbStatistics {
     return (try global()).statistics(gpa);
+}
+
+/// 热加载指定表（文件优先）；返回是否发生了重载。
+pub fn reload(comptime T: type) Error!bool {
+    return (try global()).reload(T);
+}
+
+/// 检查全部已加载表（返回发生重载的表数）。
+pub fn reloadAll() Error!usize {
+    return (try global()).reloadAll();
 }

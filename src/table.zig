@@ -49,6 +49,7 @@ pub const AnyTable = struct {
         markDirty: *const fn (ptr: *anyopaque) bool,
         saveTo: *const fn (ptr: *anyopaque, path: []const u8, pretty: bool) anyerror!u64,
         statistics: *const fn (ptr: *anyopaque, gpa: std.mem.Allocator) anyerror!model.TableStatistics,
+        reloadIfChanged: *const fn (ptr: *anyopaque, path: []const u8) anyerror!bool,
     };
 
     pub fn cast(comptime T: type, self: AnyTable) *Table(T) {
@@ -84,6 +85,12 @@ pub fn Table(comptime T: type) type {
         loaded: bool = false,
 
         dirty: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        /// 已加载/已写盘文件的签名（mtime + 大小）：热加载的变化驱动判据。
+        file_sig: ?persist.FileSignature = null,
+        /// 行级同步哈希（ID → 上次与文件一致时的行内容哈希）：双向热更新的三方合并基准。
+        synced: std.AutoHashMapUnmanaged(i64, u64) = .empty,
+        /// 上次热加载检查时间（毫秒，读入口节流用）。
+        last_reload_check_ms: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
         save_mutex: std.Io.Mutex = .init,
         persist_count: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
         persisted_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
@@ -118,6 +125,7 @@ pub fn Table(comptime T: type) type {
             }
             self.by_id.deinit();
             self.ids.deinit(self.gpa);
+            self.synced.deinit(self.gpa);
             self.indexes.deinit(self.gpa);
             self.uniques.deinit();
             self.lock.unlock(self.io);
@@ -135,6 +143,7 @@ pub fn Table(comptime T: type) type {
             .markDirty = vtableMarkDirty,
             .saveTo = vtableSaveTo,
             .statistics = vtableStatistics,
+            .reloadIfChanged = vtableReloadIfChanged,
         };
 
         fn vtableMarkDirty(ptr: *anyopaque) bool {
@@ -167,6 +176,11 @@ pub fn Table(comptime T: type) type {
         fn vtableStatistics(ptr: *anyopaque, gpa: std.mem.Allocator) anyerror!model.TableStatistics {
             const self: *Self = @ptrCast(@alignCast(ptr));
             return self.statistics(gpa);
+        }
+
+        fn vtableReloadIfChanged(ptr: *anyopaque, path: []const u8) anyerror!bool {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            return self.reloadIfChanged(path);
         }
 
         // ------------------------------------------------------------------
@@ -206,11 +220,16 @@ pub fn Table(comptime T: type) type {
         /// - 加载时**修正 ID 计数器**为 `max(id)+1`（C# 版未修正，加载后新增会从 1 开始覆盖旧数据）；
         /// - 唯一冲突的对象**直接跳过**并记警告（C# 版对象留在表中但唯一索引缺失，状态不一致）。
         pub fn load(self: *Self, path: []const u8) void {
+            const sig = persist.FileSignature.ofFile(self.io, path) catch |err| blk: {
+                log.warn("读取 {s} 数据文件签名失败（{s}）：{s}", .{ self.type_name, path, @errorName(err) });
+                break :blk null;
+            };
             {
                 self.lock.lockUncancelable(self.io);
                 defer self.lock.unlock(self.io);
                 if (self.loaded) return;
                 self.loaded = true;
+                self.file_sig = sig;
             }
             if (self.not_save) return;
 
@@ -244,17 +263,14 @@ pub fn Table(comptime T: type) type {
                 .null => {},
                 else => log.err("{s} 数据文件顶层应为对象或数组（{s}）；将使用空表", .{ self.type_name, path }),
             }
+            // 建立行级同步基准：后续热加载据此做三方合并
+            self.rebuildSyncedLocked();
         }
 
-        fn loadItem(self: *Self, node: json.Node, path: []const u8, arena_gpa: std.mem.Allocator) void {
-            if (node != .object) {
-                log.warn("{s}：数组元素不是对象，已跳过（数据文件 {s}）", .{ self.type_name, path });
-                return;
-            }
+        /// 解析单个 JSON 对象为实体（**不含** ID 校验与索引安装；调用方接管/释放）。
+        fn parseEntity(self: *Self, node: json.Node, arena_gpa: std.mem.Allocator) ?T {
+            if (node != .object) return null;
             var object = T.initEmpty(self.gpa);
-            var consumed = false;
-            defer if (!consumed) object.deinit();
-
             for (node.object) |entry| {
                 const name = entry.name;
                 if (std.ascii.eqlIgnoreCase(name, "Id")) {
@@ -271,6 +287,81 @@ pub fn Table(comptime T: type) type {
                 const converted = json.nodeToValue(entry.value, arena_gpa) catch continue;
                 _ = object.setField(field.name, converted) catch false;
             }
+            return object;
+        }
+
+        /// 行内容哈希（零分配）：双向热更新三方合并的判据。
+        ///
+        /// 只按**规范化后的值**计算（文本原字节、整数 i64、浮点 f64、时间秒），
+        /// 因此「内存对象」与「从文件装载的对象」内容等价时哈希一致。
+        pub fn entityHash(self: *Self, object: *const T) u64 {
+            var hasher = std.hash.Wyhash.init(0);
+            const id = object.getId();
+            hasher.update(std.mem.asBytes(&id));
+            hasher.update(entity.getName(object));
+            for (self.fields) |field| {
+                if (!field.save) continue;
+                if (index.isIdOrName(field.name)) continue;
+                const raw = object.getField(field.name) orelse {
+                    hasher.update(&[_]u8{0});
+                    continue;
+                };
+                hasher.update(&[_]u8{@backingInt(std.meta.activeTag(raw))});
+                switch (raw) {
+                    .null => {},
+                    .boolean => |v| hasher.update(&[_]u8{@intFromBool(v)}),
+                    .int => |v| hasher.update(std.mem.asBytes(&v)),
+                    .float => |v| hasher.update(std.mem.asBytes(&v)),
+                    .decimal => |d| {
+                        const scaled = d.toI64() orelse 0;
+                        hasher.update(std.mem.asBytes(&scaled));
+                    },
+                    .text => |text| {
+                        if (field.kind == .json) {
+                            hashJsonText(&hasher, text);
+                        } else {
+                            hasher.update(text);
+                        }
+                    },
+                    .blob => |bytes| hasher.update(bytes),
+                    .datetime => |dt| {
+                        const seconds = dt.toUnixSeconds();
+                        hasher.update(std.mem.asBytes(&seconds));
+                    },
+                }
+            }
+            return hasher.final();
+        }
+
+        /// 重建行级同步哈希（**持有写锁**；`load` / `saveTo` 后调用）。
+        fn rebuildSyncedLocked(self: *Self) void {
+            self.synced.clearRetainingCapacity();
+            var iterator = self.by_id.iterator();
+            while (iterator.next()) |entry| {
+                const id = entry.key_ptr.*;
+                const object: *const T = &entry.value_ptr.*.value;
+                self.synced.put(self.gpa, id, self.entityHash(object)) catch {
+                    // 内存不足：清空基准，热加载退化为「文件整体覆盖」
+                    self.synced.clearRetainingCapacity();
+                    return;
+                };
+            }
+        }
+
+        fn refreshSynced(self: *Self) void {
+            self.lock.lockUncancelable(self.io);
+            defer self.lock.unlock(self.io);
+            self.rebuildSyncedLocked();
+        }
+
+        fn loadItem(self: *Self, node: json.Node, path: []const u8, arena_gpa: std.mem.Allocator) void {
+            const parsed = self.parseEntity(node, arena_gpa) orelse {
+                log.warn("{s}：数组元素不是对象，已跳过（数据文件 {s}）", .{ self.type_name, path });
+                return;
+            };
+            var object = parsed;
+            var consumed = false;
+            defer if (!consumed) object.deinit();
 
             const id = object.getId();
             if (id <= 0) {
@@ -385,6 +476,30 @@ pub fn Table(comptime T: type) type {
             return id;
         }
 
+        /// 以指定 ID 安装实体（**调用方必须已持写锁**；热加载合并用）。
+        fn installRowLocked(self: *Self, id: i64, object_arg: T) Error!void {
+            var object = object_arg;
+            var consumed = false;
+            errdefer if (!consumed) object.deinit();
+            object.setId(id);
+
+            const ref = try RefT.create(self.gpa, object);
+            consumed = true;
+            errdefer ref.release();
+
+            const handle = ref.getMut();
+            try self.uniques.add(self.fields, self.composites, id, handle, null);
+            errdefer self.uniques.remove(self.fields, self.composites, handle) catch {};
+            try self.indexEntity(id, handle, null);
+            errdefer self.removeIndexEntity(id, handle) catch {};
+
+            _ = try self.ids.insert(self.gpa, id);
+            errdefer _ = self.ids.remove(id);
+
+            try self.by_id.put(id, ref.box);
+            if (id >= self.next_id) self.next_id = id +| 1;
+        }
+
         /// 更新实体（按 `getId()` 匹配；不存在返回 `error.NotFound`）。
         ///
         /// **按字段 diff**：只重建真正变化的普通索引/唯一键（典型「改 1 个字段」的更新
@@ -392,7 +507,11 @@ pub fn Table(comptime T: type) type {
         pub fn update(self: *Self, object: T, violation: ?*Violation) Error!void {
             self.lock.lockUncancelable(self.io);
             defer self.lock.unlock(self.io);
+            try self.updateLocked(object, violation);
+        }
 
+        /// 更新（**调用方必须已持写锁**；失败时由库释放传入对象）。
+        fn updateLocked(self: *Self, object: T, violation: ?*Violation) Error!void {
             const id = object.getId();
             const old_box = self.by_id.get(id) orelse {
                 var discard = object;
@@ -428,7 +547,11 @@ pub fn Table(comptime T: type) type {
         pub fn delete(self: *Self, id: i64) bool {
             self.lock.lockUncancelable(self.io);
             defer self.lock.unlock(self.io);
+            return self.deleteLocked(id);
+        }
 
+        /// 删除（**调用方必须已持写锁**）。
+        fn deleteLocked(self: *Self, id: i64) bool {
             const box = self.by_id.get(id) orelse return false;
             const ref = RefT{ .box = box };
             const object = ref.get();
@@ -448,7 +571,11 @@ pub fn Table(comptime T: type) type {
         pub fn clear(self: *Self) void {
             self.lock.lockUncancelable(self.io);
             defer self.lock.unlock(self.io);
+            self.clearLocked();
+        }
 
+        /// 清空（**调用方必须已持写锁**）。
+        fn clearLocked(self: *Self) void {
             var iterator = self.by_id.valueIterator();
             while (iterator.next()) |box_ptr| {
                 (RefT{ .box = box_ptr.* }).release();
@@ -462,8 +589,254 @@ pub fn Table(comptime T: type) type {
                 break :blk index.IndexSet.init(self.gpa);
             };
             self.uniques.clear();
+            self.synced.clearRetainingCapacity();
             self.next_id = 1;
             self.loaded = true;
+        }
+
+        // ------------------------------------------------------------------
+        // 热加载（文件 → 内存，文件优先）
+        // ------------------------------------------------------------------
+
+        /// 当前记录的文件签名（加锁读取）。
+        pub fn fileSignature(self: *Self) ?persist.FileSignature {
+            self.lock.lockSharedUncancelable(self.io);
+            defer self.lock.unlockShared(self.io);
+            return self.file_sig;
+        }
+
+        /// 记录文件签名（自身写盘后调用，避免把自己的写入当成外部变化）。
+        fn setFileSignature(self: *Self, sig: ?persist.FileSignature) void {
+            self.lock.lockUncancelable(self.io);
+            defer self.lock.unlock(self.io);
+            self.file_sig = sig;
+        }
+
+        /// 读入口节流：距上次检查不足 `interval_ms` 时返回 `false`（不重复 `stat`）。
+        pub fn shouldCheckReload(self: *Self, interval_ms: u64) bool {
+            if (interval_ms == 0) return true;
+            const now_ns = std.Io.Timestamp.now(self.io, .awake).nanoseconds;
+            const now_ms: i64 = @intCast(@divTrunc(now_ns, std.time.ns_per_ms));
+            const last_ms = self.last_reload_check_ms.load(.monotonic);
+            if (last_ms != 0 and now_ms - last_ms < @as(i64, @intCast(interval_ms))) return false;
+            self.last_reload_check_ms.store(now_ms, .monotonic);
+            return true;
+        }
+
+        /// 热加载（**三方合并**）：文件被外部修改时逐行对比内存 / 文件 / 上次同步基准。
+        ///
+        /// - 变化驱动：签名（mtime + 大小）未变时只做一次 `stat`，不读盘、不解析；
+        /// - 只有内存改：保留内存（稍后写盘，文件同步为合并结果）；
+        /// - 只有文件改：采用文件；
+        /// - 两边都改（冲突）：**以文件为准**，并记 warn；
+        /// - 文件缺失 / 解析失败：**保留内存数据**并报错，不影响后续读写；
+        /// - 合并结果与文件不同时把表标记为脏（后台线程会把内存独有改动写回文件）。
+        pub fn reloadIfChanged(self: *Self, path: []const u8) Error!bool {
+            if (self.not_save) return false;
+
+            const current = persist.FileSignature.ofFile(self.io, path) catch |err| {
+                log.warn("检测 {s} 数据文件变化失败（{s}）：{s}", .{ self.type_name, path, @errorName(err) });
+                return false;
+            };
+            const sig = current orelse return false; // 文件不存在：保留内存数据
+            if (self.fileSignature()) |known| {
+                if (known.eql(sig)) return false; // 未变化：不读盘、不解析
+            }
+
+            const maybe_text = persist.readFileAlloc(self.io, self.gpa, path, max_load_bytes) catch |err| {
+                log.warn("热加载 {s} 失败（读取 {s}）：{s}；保留内存数据", .{ self.type_name, path, @errorName(err) });
+                return error.PersistError;
+            };
+            const text = maybe_text orelse return false;
+            defer self.gpa.free(text);
+
+            var arena = std.heap.ArenaAllocator.init(self.gpa);
+            defer arena.deinit();
+            const arena_gpa = arena.allocator();
+
+            const blank = std.mem.trim(u8, text, " \t\r\n").len == 0;
+            const node: json.Node = if (blank) .null else json.parseLax(arena_gpa, text) catch |err| {
+                log.warn("热加载 {s} 解析失败（数据文件 {s}）：{s}；保留内存数据", .{ self.type_name, path, @errorName(err) });
+                return error.PersistError;
+            };
+
+            const FileRow = struct {
+                id: i64,
+                object: T,
+                hash: u64,
+                consumed: bool = false,
+            };
+
+            var file_rows: std.ArrayList(FileRow) = .empty;
+            defer {
+                for (file_rows.items) |*row| {
+                    if (!row.consumed) row.object.deinit();
+                }
+                file_rows.deinit(self.gpa);
+            }
+
+            switch (node) {
+                .list => |items| {
+                    try file_rows.ensureTotalCapacity(self.gpa, items.len);
+                    for (items) |item| {
+                        const parsed = self.parseEntity(item, arena_gpa) orelse {
+                            log.warn("{s}：数组元素不是对象，已跳过（数据文件 {s}）", .{ self.type_name, path });
+                            continue;
+                        };
+                        var object = parsed;
+                        const id = object.getId();
+                        if (id <= 0) {
+                            log.warn("{s}：发现无效对象 ID {d}，已跳过（数据文件 {s}）", .{ self.type_name, id, path });
+                            var discard = object;
+                            discard.deinit();
+                            continue;
+                        }
+                        var duplicate = false;
+                        for (file_rows.items) |existing| {
+                            if (existing.id == id) {
+                                duplicate = true;
+                                break;
+                            }
+                        }
+                        if (duplicate) {
+                            log.warn("{s}：发现重复对象 ID {d}，已跳过（数据文件 {s}）", .{ self.type_name, id, path });
+                            var discard = object;
+                            discard.deinit();
+                            continue;
+                        }
+                        const hash = self.entityHash(&object);
+                        file_rows.appendAssumeCapacity(.{ .id = id, .object = object, .hash = hash });
+                    }
+                },
+                .object => {
+                    if (self.parseEntity(node, arena_gpa)) |object| {
+                        const id = object.getId();
+                        if (id > 0) {
+                            const hash = self.entityHash(&object);
+                            try file_rows.append(self.gpa, .{ .id = id, .object = object, .hash = hash });
+                        } else {
+                            var discard = object;
+                            discard.deinit();
+                        }
+                    }
+                },
+                .null => {},
+                else => log.err("{s} 数据文件顶层应为对象或数组（{s}）；热加载按空表合并", .{ self.type_name, path }),
+            }
+
+            self.lock.lockUncancelable(self.io);
+            defer self.lock.unlock(self.io);
+
+            var file_index = std.AutoHashMap(i64, usize).init(self.gpa);
+            defer file_index.deinit();
+            for (file_rows.items, 0..) |row, i| {
+                const gop = try file_index.getOrPut(row.id);
+                if (!gop.found_existing) gop.value_ptr.* = i;
+            }
+
+            const mem_ids = try self.gpa.alloc(i64, self.by_id.count());
+            defer self.gpa.free(mem_ids);
+            var mem_count: usize = 0;
+            var iterator = self.by_id.keyIterator();
+            while (iterator.next()) |key| : (mem_count += 1) mem_ids[mem_count] = key.*;
+
+            var adopted: usize = 0;
+            var kept: usize = 0;
+            var conflicts: usize = 0;
+            var removed: usize = 0;
+
+            for (mem_ids) |id| {
+                const box = self.by_id.get(id) orelse continue;
+                const mem_hash = self.entityHash(&box.value);
+                const base = self.synced.get(id);
+
+                if (file_index.get(id)) |row_index| {
+                    const row = &file_rows.items[row_index];
+                    if (base) |base_hash| {
+                        if (mem_hash == base_hash) {
+                            // 内存未改：文件改了才采用
+                            if (row.hash != base_hash) {
+                                if (try self.applyFileRowLocked(row)) adopted += 1;
+                            }
+                        } else if (row.hash == base_hash) {
+                            kept += 1; // 只有内存改 → 保留
+                        } else if (mem_hash == row.hash) {
+                            // 两边改成一样，无需动作
+                        } else {
+                            conflicts += 1; // 两边都改 → 文件优先
+                            if (try self.applyFileRowLocked(row)) adopted += 1;
+                        }
+                    } else if (mem_hash != row.hash) {
+                        // 无同步基准（双方都新增）→ 文件优先
+                        conflicts += 1;
+                        if (try self.applyFileRowLocked(row)) adopted += 1;
+                    }
+                    continue;
+                }
+
+                // 文件里没有该行
+                if (base == null) {
+                    kept += 1; // 内存新增（未同步）
+                    continue;
+                }
+                if (mem_hash == base.?) {
+                    if (self.deleteLocked(id)) removed += 1; // 内存未改、文件已删除
+                    _ = self.synced.remove(id);
+                } else {
+                    conflicts += 1; // 内存改 / 文件删 → 文件优先
+                    if (self.deleteLocked(id)) removed += 1;
+                    _ = self.synced.remove(id);
+                }
+            }
+
+            // 文件新增（内存没有的行）
+            var file_iterator = file_index.iterator();
+            while (file_iterator.next()) |entry| {
+                const id = entry.key_ptr.*;
+                if (self.by_id.contains(id)) continue;
+                const row = &file_rows.items[entry.value_ptr.*];
+                if (self.synced.get(id)) |base_hash| {
+                    if (row.hash == base_hash) continue; // 文件未改且内存已删除 → 保持删除
+                    conflicts += 1; // 内存删 / 文件改 → 文件优先（恢复）
+                }
+                if (try self.applyFileRowLocked(row)) adopted += 1;
+            }
+
+            self.file_sig = sig;
+            // 保留了内存独有改动 → 需要把合并结果写回文件
+            self.dirty.store(kept > 0, .release);
+
+            if (adopted + kept + conflicts + removed == 0) return false;
+            log.info(
+                "热加载 {s}（合并）：采用文件 {d} / 保留内存 {d} / 冲突取文件 {d} / 删除 {d}（数据文件 {s}）",
+                .{ self.type_name, adopted, kept, conflicts, removed, path },
+            );
+            return true;
+        }
+
+        /// 应用一条文件行（替换同 ID 内存行或新增）；返回是否成功。
+        ///
+        /// 失败（唯一约束/OOM）时保留内存行并记 warn；对象内存由 update/install 原语接管。
+        fn applyFileRowLocked(self: *Self, row: anytype) Error!bool {
+            const id = row.id;
+            const object = row.object;
+            row.consumed = true; // 无论成败，updateLocked/installRowLocked 都会处置这个对象
+
+            if (self.by_id.contains(id)) {
+                self.updateLocked(object, null) catch |err| {
+                    log.warn("热加载 {s}：采用文件行 ID {d} 失败（{s}）；保留内存行", .{ self.type_name, id, @errorName(err) });
+                    return false;
+                };
+            } else {
+                self.installRowLocked(id, object) catch |err| {
+                    log.warn("热加载 {s}：新增文件行 ID {d} 失败（{s}）；跳过该行", .{ self.type_name, id, @errorName(err) });
+                    return false;
+                };
+            }
+            if (self.by_id.get(id)) |box| {
+                self.synced.put(self.gpa, id, self.entityHash(&box.value)) catch {};
+            }
+            return true;
         }
 
         // ------------------------------------------------------------------
@@ -876,6 +1249,12 @@ pub fn Table(comptime T: type) type {
             _ = self.persisted_bytes.fetchAdd(text.len, .monotonic);
             const elapsed = std.Io.Timestamp.durationTo(started, std.Io.Timestamp.now(self.io, .awake));
             self.last_persist_ms.store(@intCast(@max(elapsed.toMilliseconds(), 0)), .monotonic);
+
+            // 记录自己的写入签名：避免下一轮热加载把自己的写盘误判为外部变化
+            const sig = persist.FileSignature.ofFile(self.io, path) catch self.fileSignature();
+            self.setFileSignature(sig);
+            // 写盘即「全部行已与文件一致」：重建行级同步基准
+            self.refreshSynced();
             return text.len;
         }
 
@@ -1044,6 +1423,33 @@ pub fn Table(comptime T: type) type {
             return null;
         }
     };
+}
+
+/// JSON 文本哈希（忽略字符串外的空白，使「内存原文」与「文件解析后的紧凑文本」等价）。
+fn hashJsonText(hasher: *std.hash.Wyhash, text: []const u8) void {
+    var in_string = false;
+    var escaped = false;
+    for (text) |c| {
+        if (in_string) {
+            hasher.update(&[_]u8{c});
+            if (escaped) {
+                escaped = false;
+            } else if (c == '\\') {
+                escaped = true;
+            } else if (c == '"') {
+                in_string = false;
+            }
+            continue;
+        }
+        switch (c) {
+            ' ', '\t', '\r', '\n' => continue,
+            '"' => {
+                in_string = true;
+                hasher.update(&[_]u8{c});
+            },
+            else => hasher.update(&[_]u8{c}),
+        }
+    }
 }
 
 fn wantedIndex(only: ?[]const []const u8, name: []const u8) bool {

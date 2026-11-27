@@ -30,6 +30,10 @@
   删除只做二分 + 取负，墓碑 ≥ 64 且不少于存活时原地压缩；`Table.ids` 是表级升序 ID 表，
   `findAll`/无排序字段分页/落盘快照直接遍历它（**不要重新引入每次排序**）。
   改删除/分页后必须跑 `zig build bench -Doptimize=ReleaseFast` 并对比 `docs/决策记录.md` 的数字。
+- **双向热更新口径（勿改）**：内存→文件靠脏标记 + 500ms 写合并；文件→内存靠 `reload` / `reloadAll`
+  （可选 `reload_on_read_interval_ms` 读入口节流检查）。合并是**行级三方**：签名（mtime+size）变化才读盘，
+  `Table.synced` 存「上次与文件一致的行哈希」；只有两边都改的行**以文件为准**，只有内存改的行保留并回写文件。
+  文件缺失/解析失败必须**保留内存数据**（warn + 返回 `error.PersistError`）。
 
 ## 构建与验证
 
@@ -42,7 +46,7 @@ zig fmt --check build.zig src examples      # 格式
 powershell -NoProfile -ExecutionPolicy Bypass -File tools\regression.ps1   # 一键回归：fmt → Debug → ReleaseFast → 示例
 ```
 
-当前基线：**62 个测试全部通过**。改持久化/索引/唯一约束/删除路径后必须重跑 `tools/regression.ps1`，
+当前基线：**66 个测试全部通过**。改持久化/索引/唯一约束/删除/热加载后必须重跑 `tools/regression.ps1`，
 性能相关改动还要贴 `bench` 前后实测数字（见 `docs/决策记录.md` 2026-11-27 节）。
 
 ## 每轮收尾（务必）

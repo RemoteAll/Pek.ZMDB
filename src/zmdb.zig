@@ -119,6 +119,8 @@ pub const findByUnique = db.findByUnique;
 pub const findByCompositeUnique = db.findByCompositeUnique;
 pub const isUniqueValueExists = db.isUniqueValueExists;
 pub const statistics = db.statistics;
+pub const reload = db.reload;
+pub const reloadAll = db.reloadAll;
 
 test {
     // 收集各模块单测（Zig 只会跑根文件可达的 test 块）
