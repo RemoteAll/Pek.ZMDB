@@ -1,0 +1,17 @@
+.{
+    .name = .pek_zmdb,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.17.1",
+    .fingerprint = 0x2e2c3c64592b20a4,
+    .dependencies = .{
+        // Zig 侧公共基础库（DateTime / db.Value / Buf / fsio / ascii / glob）
+        .zzig = .{ .path = "../zzig" },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "examples",
+        "README.md",
+    },
+}
