@@ -26,6 +26,10 @@
 - **Zig 0.17 已踩坑**：std 无 `BTreeMap`/`Treap`、无 `std.Thread.Mutex`（锁/条件变量在 `std.Io`）；
   `std.fmt` 的 `{d:0>4}` 会输出 `+2024`（日期用手写补零）；`build.zig.zon` 必须有 `fingerprint`。
 - 中文 `.ps1` 必须 **UTF-8 with BOM**；PS 5.1 下外部命令后用 `$LASTEXITCODE` 判定，不要写 `2>&1 |`。
+- **索引与删除设计（性能红线，勿无意改回）**：`ordered.IdSet` 用**负数墓碑**（`ids[i] = -id`，比较按绝对值），
+  删除只做二分 + 取负，墓碑 ≥ 64 且不少于存活时原地压缩；`Table.ids` 是表级升序 ID 表，
+  `findAll`/无排序字段分页/落盘快照直接遍历它（**不要重新引入每次排序**）。
+  改删除/分页后必须跑 `zig build bench -Doptimize=ReleaseFast` 并对比 `docs/决策记录.md` 的数字。
 
 ## 构建与验证
 
@@ -33,11 +37,13 @@
 zig build test                              # Debug 全部单测（含泄漏检测）
 zig build test -Doptimize=ReleaseFast       # 发布模式再跑一遍
 zig build example                           # 示例端到端（写 AppData/Data/Demo.User.json，可重复运行）
+zig build bench -Doptimize=ReleaseFast      # 性能基准（-Drows=N 调行数）
 zig fmt --check build.zig src examples      # 格式
 powershell -NoProfile -ExecutionPolicy Bypass -File tools\regression.ps1   # 一键回归：fmt → Debug → ReleaseFast → 示例
 ```
 
-当前基线：**60 个测试全部通过**。改持久化/索引/唯一约束后必须重跑 `tools/regression.ps1` 并如实汇报输出。
+当前基线：**62 个测试全部通过**。改持久化/索引/唯一约束/删除路径后必须重跑 `tools/regression.ps1`，
+性能相关改动还要贴 `bench` 前后实测数字（见 `docs/决策记录.md` 2026-11-27 节）。
 
 ## 每轮收尾（务必）
 

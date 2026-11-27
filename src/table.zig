@@ -17,6 +17,7 @@ const errors = @import("error.zig");
 const index = @import("index.zig");
 const json = @import("json.zig");
 const model = @import("model.zig");
+const ordered = @import("ordered.zig");
 const persist = @import("persist.zig");
 const unique = @import("unique.zig");
 const value = @import("value.zig");
@@ -75,6 +76,8 @@ pub fn Table(comptime T: type) type {
 
         lock: std.Io.RwLock = .init,
         by_id: std.AutoHashMap(i64, *RefT.Box),
+        /// 升序 ID 表（墓碑式删除）：`findAll` / 分页 / 落盘无需再排序。
+        ids: ordered.IdSet = .{},
         indexes: index.IndexSet,
         uniques: unique.UniqueSet,
         next_id: i64 = 1,
@@ -114,6 +117,7 @@ pub fn Table(comptime T: type) type {
                 (RefT{ .box = box_ptr.* }).release();
             }
             self.by_id.deinit();
+            self.ids.deinit(self.gpa);
             self.indexes.deinit(self.gpa);
             self.uniques.deinit();
             self.lock.unlock(self.io);
@@ -231,6 +235,9 @@ pub fn Table(comptime T: type) type {
             defer self.lock.unlock(self.io);
             switch (node) {
                 .list => |items| {
+                    // 预分配容量：避免逐行扩容时的重复 rehash / 搬移
+                    self.by_id.ensureTotalCapacity(@intCast(items.len)) catch {};
+                    self.ids.ids.ensureTotalCapacity(self.gpa, items.len) catch {};
                     for (items) |item| self.loadItem(item, path, arena_gpa);
                 },
                 .object => self.loadItem(node, path, arena_gpa),
@@ -301,6 +308,9 @@ pub fn Table(comptime T: type) type {
                 ref.release();
                 return;
             };
+            _ = self.ids.insert(self.gpa, id) catch |err| {
+                log.err("{s}：加载对象 ID {d} 写入 ID 顺序表失败：{s}", .{ self.type_name, id, @errorName(err) });
+            };
             if (id >= self.next_id) self.next_id = id +| 1;
         }
 
@@ -333,6 +343,10 @@ pub fn Table(comptime T: type) type {
             self.lock.lockUncancelable(self.io);
             defer self.lock.unlock(self.io);
 
+            // 预留容量：批量插入不再逐行扩容/搬移
+            try self.by_id.ensureUnusedCapacity(@intCast(objects.len));
+            try self.ids.ids.ensureUnusedCapacity(self.gpa, objects.len);
+
             var inserted: usize = 0;
             while (inserted < objects.len) : (inserted += 1) {
                 ids[inserted] = self.insertLocked(objects[inserted], null, violation) catch |err| {
@@ -362,6 +376,9 @@ pub fn Table(comptime T: type) type {
             errdefer self.uniques.remove(self.fields, self.composites, handle) catch {};
             try self.indexEntity(id, handle, only);
             errdefer self.removeIndexEntity(id, handle) catch {};
+
+            _ = try self.ids.insert(self.gpa, id);
+            errdefer _ = self.ids.remove(id);
 
             try self.by_id.put(id, ref.box);
             self.next_id = id +| 1;
@@ -422,6 +439,7 @@ pub fn Table(comptime T: type) type {
                 log.warn("删除 {s} 对象 ID {d} 时清理唯一索引失败：{s}", .{ self.type_name, id, @errorName(err) });
             };
             _ = self.by_id.remove(id);
+            _ = self.ids.remove(id);
             ref.release();
             return true;
         }
@@ -436,6 +454,8 @@ pub fn Table(comptime T: type) type {
                 (RefT{ .box = box_ptr.* }).release();
             }
             self.by_id.clearRetainingCapacity();
+            self.ids.deinit(self.gpa);
+            self.ids = .{};
             self.indexes.deinit(self.gpa);
             self.indexes = index.IndexSet.initWithFields(self.gpa, self.fields) catch |err| blk: {
                 log.err("清空 {s} 后重建索引失败：{s}", .{ self.type_name, @errorName(err) });
@@ -462,14 +482,7 @@ pub fn Table(comptime T: type) type {
         pub fn findAll(self: *Self) !ListT {
             self.lock.lockSharedUncancelable(self.io);
             defer self.lock.unlockShared(self.io);
-
-            const ids = try self.gpa.alloc(i64, self.by_id.count());
-            defer self.gpa.free(ids);
-            var count: usize = 0;
-            var iterator = self.by_id.keyIterator();
-            while (iterator.next()) |key| : (count += 1) ids[count] = key.*;
-            if (count > 1) std.mem.sortUnstable(i64, ids, {}, comptime std.sort.asc(i64));
-            return self.collectRefs(ids);
+            return self.collectIdSetRefs(0, self.ids.count(), true);
         }
 
         /// 精确查找（走索引）。
@@ -670,22 +683,8 @@ pub fn Table(comptime T: type) type {
                 if (sort_field) |field| {
                     items = try self.pageBySortField(field, skip, take_end, ascending, total_count);
                 } else {
-                    // 无排序字段：按 ID 升序/降序取页（整数排序，不做值比较）
-                    const ids = try self.gpa.alloc(i64, total_count);
-                    defer self.gpa.free(ids);
-                    var count: usize = 0;
-                    var iterator = self.by_id.keyIterator();
-                    while (iterator.next()) |key| : (count += 1) ids[count] = key.*;
-                    if (count > 1) {
-                        if (ascending) {
-                            std.mem.sortUnstable(i64, ids, {}, comptime std.sort.asc(i64));
-                        } else {
-                            std.mem.sortUnstable(i64, ids, {}, comptime std.sort.desc(i64));
-                        }
-                    }
-                    const start = @min(skip, ids.len);
-                    const end = @min(take_end, ids.len);
-                    items = try self.collectRefs(ids[start..end]);
+                    // 无排序字段：直接按升序 ID 表取页（无排序、无临时数组）
+                    items = try self.collectIdSetRefs(skip, take_end, ascending);
                 }
             }
 
@@ -709,14 +708,15 @@ pub fn Table(comptime T: type) type {
             const Row = struct { key: ?Key, id: i64 };
             const rows = try self.gpa.alloc(Row, total_count);
             defer self.gpa.free(rows);
+            var count: usize = 0;
+            // 只释放已初始化的行（提前失败时未初始化的槽位不能当 `?Key` 解引用）
             defer {
-                for (rows) |row| {
+                for (rows[0..count]) |row| {
                     if (row.key) |key| key.deinit(self.gpa);
                 }
             }
 
             const kind = self.fieldKind(field);
-            var count: usize = 0;
             var iterator = self.by_id.iterator();
             while (iterator.next()) |entry| {
                 const id = entry.key_ptr.*;
@@ -799,13 +799,6 @@ pub fn Table(comptime T: type) type {
             self.lock.lockSharedUncancelable(self.io);
             defer self.lock.unlockShared(self.io);
 
-            const ids = try gpa.alloc(i64, self.by_id.count());
-            defer gpa.free(ids);
-            var count: usize = 0;
-            var iterator = self.by_id.keyIterator();
-            while (iterator.next()) |key| : (count += 1) ids[count] = key.*;
-            if (count > 1) std.mem.sortUnstable(i64, ids, {}, comptime std.sort.asc(i64));
-
             if (pretty) {
                 try buffer.add("[\r\n");
             } else {
@@ -813,7 +806,8 @@ pub fn Table(comptime T: type) type {
             }
 
             var first = true;
-            for (ids) |id| {
+            for (self.ids.ids.items) |id| {
+                if (id < 0) continue;
                 const box = self.by_id.get(id) orelse continue;
                 if (!first) {
                     if (pretty) {
@@ -941,11 +935,18 @@ pub fn Table(comptime T: type) type {
                 if (!field.indexed) continue;
                 if (index.isIdOrName(field.name)) continue;
 
-                const old_key: ?Key = if (old_object.getField(field.name)) |raw|
+                const old_raw = old_object.getField(field.name);
+                const new_raw = new_object.getField(field.name);
+
+                // 快路径：未变化（或同为 null）的字段直接跳过，省掉两次 normalize 分配
+                if (old_raw == null and new_raw == null) continue;
+                if (old_raw != null and new_raw != null and value.maybeEqualRaw(old_raw.?, new_raw.?)) continue;
+
+                const old_key: ?Key = if (old_raw) |raw|
                     try value.normalize(raw, field.kind, self.gpa)
                 else
                     null;
-                const new_key: ?Key = if (new_object.getField(field.name)) |raw|
+                const new_key: ?Key = if (new_raw) |raw|
                     try value.normalize(raw, field.kind, self.gpa)
                 else
                     null;
@@ -977,6 +978,42 @@ pub fn Table(comptime T: type) type {
             for (ids) |id| {
                 const box = self.by_id.get(id) orelse continue;
                 out.appendAssumeCapacity((RefT{ .box = box }).retain());
+            }
+            return .{ .gpa = self.gpa, .items = try out.toOwnedSlice(self.gpa) };
+        }
+
+        /// 从升序 ID 表取 `[skip, take_end)` 区间（不分配临时 ID 数组）。
+        fn collectIdSetRefs(self: *Self, skip: usize, take_end: usize, ascending: bool) !ListT {
+            var out = std.ArrayList(RefT).empty;
+            errdefer {
+                for (out.items) |ref| ref.release();
+                out.deinit(self.gpa);
+            }
+            const wanted = if (take_end > skip) take_end - skip else 0;
+            try out.ensureTotalCapacity(self.gpa, @min(wanted, self.ids.count()));
+
+            var position: usize = 0;
+            if (ascending) {
+                for (self.ids.ids.items) |id| {
+                    if (id < 0) continue;
+                    if (position >= take_end) break;
+                    if (position >= skip) {
+                        if (self.by_id.get(id)) |box| out.appendAssumeCapacity((RefT{ .box = box }).retain());
+                    }
+                    position += 1;
+                }
+            } else {
+                var cursor: usize = self.ids.ids.items.len;
+                while (cursor > 0) {
+                    cursor -= 1;
+                    const id = self.ids.ids.items[cursor];
+                    if (id < 0) continue;
+                    if (position >= take_end) break;
+                    if (position >= skip) {
+                        if (self.by_id.get(id)) |box| out.appendAssumeCapacity((RefT{ .box = box }).retain());
+                    }
+                    position += 1;
+                }
             }
             return .{ .gpa = self.gpa, .items = try out.toOwnedSlice(self.gpa) };
         }

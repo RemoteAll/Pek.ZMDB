@@ -12,23 +12,46 @@ const value = @import("value.zig");
 pub const Key = value.Key;
 
 /// 每个索引值对应的 ID 集合（升序、去重）。
+///
+/// # 为什么用「负数墓碑」而不是立即搬移
+/// 单调递增的 ID 天然尾部追加（`O(1)`）；删除若直接 `orderedRemove`，一个含有
+/// 10 万 ID 的桶每删一行都要搬移约 400 KB（实测布尔双桶 / 低频文本值删除是删除操作
+/// 的主要开销）。这里改为**把 ID 取负作为墓碑**：不额外占内存、不破坏排序
+/// （比较按绝对值），删除只做二分 + 取负；墓碑超过半数时原地压缩（`O(n)`，摊还 `O(1)`）。
 pub const IdSet = struct {
+    /// 升序 ID（负数表示已删除的墓碑；ID 本身恒为正）。
     ids: std.ArrayList(i64) = .empty,
+    /// 存活数量（`O(1)` 读取；`ids.len - live` = 墓碑数）。
+    live: usize = 0,
 
     pub fn deinit(self: *IdSet, gpa: std.mem.Allocator) void {
         self.ids.deinit(gpa);
+        self.live = 0;
     }
 
+    /// 存活数量。
     pub fn count(self: IdSet) usize {
-        return self.ids.items.len;
+        return self.live;
     }
 
-    /// 插入（返回是否新增；已存在返回 `false`）。
+    /// 插入（返回是否新增；已存在返回 `false`；已删除的 ID 重新插入视为新增）。
     pub fn insert(self: *IdSet, gpa: std.mem.Allocator, id: i64) !bool {
         const items = self.ids.items;
+        // 常见路径：ID 单调递增 → 尾部追加（无二分、无搬移）
+        if (items.len == 0 or magnitude(items[items.len - 1]) < id) {
+            try self.ids.append(gpa, id);
+            self.live += 1;
+            return true;
+        }
         const index = std.sort.lowerBound(i64, items, id, compareId);
-        if (index < items.len and items[index] == id) return false;
+        if (index < items.len and magnitude(items[index]) == id) {
+            if (items[index] > 0) return false;
+            items[index] = id; // 复活墓碑
+            self.live += 1;
+            return true;
+        }
         try self.ids.insert(gpa, index, id);
+        self.live += 1;
         return true;
     }
 
@@ -36,8 +59,11 @@ pub const IdSet = struct {
     pub fn remove(self: *IdSet, id: i64) bool {
         const items = self.ids.items;
         const index = std.sort.lowerBound(i64, items, id, compareId);
-        if (index >= items.len or items[index] != id) return false;
-        _ = self.ids.orderedRemove(index);
+        if (index >= items.len or magnitude(items[index]) != id) return false;
+        if (items[index] < 0) return false;
+        items[index] = -id;
+        self.live -= 1;
+        self.compact();
         return true;
     }
 
@@ -47,13 +73,47 @@ pub const IdSet = struct {
         return index < items.len and items[index] == id;
     }
 
-    /// 追加到调用方列表（保持升序）。
+    /// 追加全部存活 ID（升序）。
     pub fn appendTo(self: IdSet, gpa: std.mem.Allocator, out: *std.ArrayList(i64)) !void {
-        try out.appendSlice(gpa, self.ids.items);
+        try out.ensureUnusedCapacity(gpa, self.ids.items.len);
+        for (self.ids.items) |id| {
+            if (id < 0) continue;
+            out.appendAssumeCapacity(id);
+        }
+    }
+
+    /// 追加存活 ID，满了 `limit` 即停（升序）。
+    pub fn appendToLimit(self: IdSet, gpa: std.mem.Allocator, out: *std.ArrayList(i64), limit: usize) !void {
+        for (self.ids.items) |id| {
+            if (id < 0) continue;
+            try out.append(gpa, id);
+            if (out.items.len >= limit) return;
+        }
+    }
+
+    /// 墓碑过多时原地压缩（**只能在持有写锁时调用**）。
+    ///
+    /// 触发条件：墓碑 ≥ 64 且墓碑数不少于存活数（摊还 `O(1)`）。
+    pub fn compact(self: *IdSet) void {
+        if (self.ids.items.len < 64) return;
+        const dead = self.ids.items.len - self.live;
+        if (dead < 64 or dead < self.live) return;
+        var write: usize = 0;
+        for (self.ids.items) |id| {
+            if (id < 0) continue;
+            self.ids.items[write] = id;
+            write += 1;
+        }
+        self.ids.shrinkRetainingCapacity(write);
+        self.live = write;
+    }
+
+    fn magnitude(id: i64) i64 {
+        return if (id < 0) -id else id;
     }
 
     fn compareId(target: i64, item: i64) std.math.Order {
-        return std.math.order(target, item);
+        return std.math.order(target, magnitude(item));
     }
 };
 
@@ -364,6 +424,49 @@ test "有序映射：插入/查找/范围/删除" {
     }
     try testing.expectEqual(@as(i64, 1000), desc.items[0]);
     try testing.expectEqual(@as(i64, 10), desc.items[desc.items.len - 1]);
+}
+
+test "ID 集合：负数墓碑与摊还压缩" {
+    const gpa = testing.allocator;
+    var set: IdSet = .{};
+    defer set.deinit(gpa);
+
+    var id: i64 = 1;
+    while (id <= 200) : (id += 1) _ = try set.insert(gpa, id);
+    try testing.expectEqual(@as(usize, 200), set.count());
+
+    // 删掉 101..200：墓碑（负数）不少于存活，压缩到 100 个
+    id = 101;
+    while (id <= 200) : (id += 1) try testing.expect(set.remove(id));
+    try testing.expectEqual(@as(usize, 100), set.count());
+    try testing.expectEqual(@as(usize, 100), set.ids.items.len);
+    try testing.expect(!set.remove(150));
+
+    // 再删 1..51：墓碑达到 51，未达压缩阈值（≥64），保留负数墓碑
+    id = 1;
+    while (id <= 51) : (id += 1) try testing.expect(set.remove(id));
+    try testing.expectEqual(@as(usize, 49), set.count());
+    try testing.expect(set.ids.items.len > 49);
+    try testing.expect(!set.contains(150));
+    try testing.expect(!set.contains(10));
+
+    // 墓碑未达压缩阈值（<64）时不搬移，读取时按负数跳过
+    set.compact();
+    try testing.expectEqual(@as(usize, 100), set.ids.items.len);
+    try testing.expectEqual(@as(usize, 49), set.count());
+    id = 201;
+    while (id <= 210) : (id += 1) _ = try set.insert(gpa, id);
+    try testing.expectEqual(@as(usize, 59), set.count());
+    try testing.expect(set.contains(52));
+    try testing.expect(set.contains(210));
+
+    var out: std.ArrayList(i64) = .empty;
+    defer out.deinit(gpa);
+    try set.appendTo(gpa, &out);
+    try testing.expectEqual(@as(usize, 59), out.items.len);
+    for (out.items[1..], out.items[0 .. out.items.len - 1]) |current, previous| {
+        try testing.expect(current > previous);
+    }
 }
 
 test "ID 集合：去重与升序" {

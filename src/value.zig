@@ -301,6 +301,24 @@ pub fn normalize(value: Value, kind: FieldKind, gpa: std.mem.Allocator) error{Ou
     }
 }
 
+/// 快速判等（只做零分配的**同类型原值**比较）。
+///
+/// 返回 `true` 表示「可以确定两者规范化后相等」；返回 `false` 只表示「无法快速判定」，
+/// 调用方仍应按字段类型 `normalize` 后比较（例如 `"5"` 与 `5` 对整数字段是等价的）。
+/// 用于更新时的索引 diff 快路径：绝大多数字段未变化，可省掉两次分配 + 比较。
+pub fn maybeEqualRaw(a: Value, b: Value) bool {
+    if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
+    return switch (a) {
+        .null => true,
+        .boolean => |v| v == b.boolean,
+        .int => |v| v == b.int,
+        .float => |v| v == b.float,
+        .text => |v| std.mem.eql(u8, v, b.text),
+        .blob => |v| std.mem.eql(u8, v, b.blob),
+        else => false,
+    };
+}
+
 /// 布尔模式（`find_by_like` 智能值；无法识别返回 null）。
 pub fn parseBoolPattern(pattern: []const u8) ?bool {
     const s = std.mem.trim(u8, pattern, " \t\r\n");

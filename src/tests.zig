@@ -201,6 +201,49 @@ test "findAll 按 ID 升序" {
     }
 }
 
+test "墓碑删除：findAll 与分页顺序仍正确" {
+    var db = try memoryDb();
+    defer db.deinit();
+    var index: i64 = 1;
+    while (index <= 10) : (index += 1) _ = try insertUser(&db, index);
+
+    // 删掉中间几行，制造墓碑（不立即搬移）
+    for ([_]i64{ 1, 4, 5, 9 }) |id| try testing.expect(try db.delete(User, id));
+
+    var all = try db.findAll(User);
+    defer all.deinit();
+    try testing.expectEqual(@as(usize, 6), all.len());
+    const expected = [_]i64{ 2, 3, 6, 7, 8, 10 };
+    for (expected, 0..) |want, i| try testing.expectEqual(want, all.at(i).getId());
+
+    // 分页：跨墓碑切片仍然连续
+    var page = try db.findByPage(User, null, 0, 4, true);
+    defer page.deinit();
+    try testing.expectEqual(@as(usize, 6), page.total_count);
+    try testing.expectEqual(@as(usize, 2), page.total_pages);
+    const first_page = [_]i64{ 2, 3, 6, 7 };
+    for (first_page, 0..) |want, i| try testing.expectEqual(want, page.at(i).getId());
+
+    var second = try db.findByPage(User, null, 1, 4, true);
+    defer second.deinit();
+    const second_page = [_]i64{ 8, 10 };
+    for (second_page, 0..) |want, i| try testing.expectEqual(want, second.at(i).getId());
+
+    // 降序第一页（逆序遍历 ID 表）
+    var desc = try db.findByPage(User, null, 0, 4, false);
+    defer desc.deinit();
+    const desc_page = [_]i64{ 10, 8, 7, 6 };
+    for (desc_page, 0..) |want, i| try testing.expectEqual(want, desc.at(i).getId());
+
+    // 删除后可重新使用该 ID 值域（ID 不复用，仅验证新插入仍在末尾）
+    const next = try insertUser(&db, 11);
+    try testing.expectEqual(@as(i64, 11), next);
+    var all2 = try db.findAll(User);
+    defer all2.deinit();
+    try testing.expectEqual(@as(usize, 7), all2.len());
+    try testing.expectEqual(@as(i64, 11), all2.at(6).getId());
+}
+
 test "Name / Id 无需声明即可查询" {
     var db = try memoryDb();
     defer db.deinit();

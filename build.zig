@@ -46,4 +46,26 @@ pub fn build(b: *std.Build) void {
     const run_example = b.addRunArtifact(example);
     const example_step = b.step("example", "运行示例（examples/basic.zig）");
     example_step.dependOn(&run_example.step);
+
+    // 性能基准（ReleaseFast 下才有意义）
+    const bench_rows = b.option(usize, "rows", "基准行数（默认 100000）") orelse 100_000;
+    const bench_options = b.addOptions();
+    bench_options.addOption(usize, "bench_rows", bench_rows);
+
+    const bench = b.addExecutable(.{
+        .name = "zmdb-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/bench.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &imports,
+        }),
+    });
+    bench.root_module.addImport("pek_zmdb", lib_module);
+    bench.root_module.addOptions("build_options", bench_options);
+    b.installArtifact(bench);
+
+    const run_bench = b.addRunArtifact(bench);
+    const bench_step = b.step("bench", "运行性能基准（建议 -Doptimize=ReleaseFast）");
+    bench_step.dependOn(&run_bench.step);
 }

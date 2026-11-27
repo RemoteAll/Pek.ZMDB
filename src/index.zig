@@ -86,11 +86,15 @@ pub const TypedIndex = union(enum) {
         switch (self.*) {
             .boolean => |*buckets| {
                 const slot: usize = if (key == .boolean and key.boolean) 1 else 0;
-                return buckets[slot].insert(gpa, id);
+                const added = try buckets[slot].insert(gpa, id);
+                buckets[slot].compact();
+                return added;
             },
             .ordered => |*map| {
                 const entry = try map.getOrPut(key);
-                return entry.node.ids.insert(gpa, id);
+                const added = try entry.node.ids.insert(gpa, id);
+                entry.node.ids.compact();
+                return added;
             },
             .exact => |*map| {
                 const text = switch (key) {
@@ -125,11 +129,32 @@ pub const TypedIndex = union(enum) {
                     gpa.free(text);
                 }
                 const added = try exact_entry.value_ptr.insert(gpa, id);
+                exact_entry.value_ptr.compact();
 
-                const lower_text = try asciiLowerAlloc(gpa, exact_entry.key_ptr.*);
+                // 小写键：常见重复值（状态/分类等）走栈上折叠 + 查找，零分配
+                const canonical = exact_entry.key_ptr.*;
+                var stack: [128]u8 = undefined;
+                if (canonical.len <= stack.len) {
+                    const lower = asciiLowerInto(stack[0..canonical.len], canonical);
+                    if (index.lower.findNode(.{ .text = lower })) |node| {
+                        _ = try node.ids.insert(gpa, id);
+                        node.ids.compact();
+                        return added;
+                    }
+                    const owned = try gpa.dupe(u8, lower);
+                    errdefer gpa.free(owned);
+                    const lower_entry = try index.lower.getOrPut(.{ .text = owned });
+                    if (!lower_entry.created) gpa.free(owned);
+                    _ = try lower_entry.node.ids.insert(gpa, id);
+                    lower_entry.node.ids.compact();
+                    return added;
+                }
+
+                const lower_text = try asciiLowerAlloc(gpa, canonical);
                 const lower_entry = try index.lower.getOrPut(.{ .text = lower_text });
                 if (!lower_entry.created) gpa.free(lower_text);
                 _ = try lower_entry.node.ids.insert(gpa, id);
+                lower_entry.node.ids.compact();
                 return added;
             },
         }
@@ -140,11 +165,14 @@ pub const TypedIndex = union(enum) {
         switch (self.*) {
             .boolean => |*buckets| {
                 const slot: usize = if (key == .boolean and key.boolean) 1 else 0;
-                return buckets[slot].remove(id);
+                const removed = buckets[slot].remove(id);
+                buckets[slot].compact();
+                return removed;
             },
             .ordered => |*map| {
                 const node = map.findNode(key) orelse return false;
                 const removed = node.ids.remove(id);
+                node.ids.compact();
                 if (node.ids.count() == 0) _ = map.remove(key);
                 return removed;
             },
@@ -155,6 +183,7 @@ pub const TypedIndex = union(enum) {
                 };
                 const entry = map.getEntry(text) orelse return false;
                 const removed = entry.value_ptr.remove(id);
+                entry.value_ptr.compact();
                 if (entry.value_ptr.count() == 0) {
                     const removed_entry = map.fetchRemove(text).?;
                     gpa.free(removed_entry.key);
@@ -171,6 +200,7 @@ pub const TypedIndex = union(enum) {
                 var removed = false;
                 if (index.exact.getEntry(text)) |entry| {
                     removed = entry.value_ptr.remove(id);
+                    entry.value_ptr.compact();
                     if (entry.value_ptr.count() == 0) {
                         const removed_entry = index.exact.fetchRemove(text).?;
                         gpa.free(removed_entry.key);
@@ -178,17 +208,28 @@ pub const TypedIndex = union(enum) {
                         ids.deinit(gpa);
                     }
                 }
+                // 小写键：栈上折叠查（短文本零分配）
+                var stack: [128]u8 = undefined;
+                if (text.len <= stack.len) {
+                    const lower = asciiLowerInto(stack[0..text.len], text);
+                    if (index.lower.findNode(.{ .text = lower })) |node| {
+                        _ = node.ids.remove(id);
+                        node.ids.compact();
+                        if (node.ids.count() == 0) _ = index.lower.remove(.{ .text = lower });
+                    }
+                    return removed;
+                }
                 const lower_text = try asciiLowerAlloc(gpa, text);
                 defer gpa.free(lower_text);
                 if (index.lower.findNode(.{ .text = lower_text })) |node| {
                     _ = node.ids.remove(id);
+                    node.ids.compact();
                     if (node.ids.count() == 0) _ = index.lower.remove(.{ .text = lower_text });
                 }
                 return removed;
             },
         }
     }
-
     /// 精确查询（结果追加到 `out`）。
     pub fn find(self: *TypedIndex, gpa: std.mem.Allocator, key: Key, out: *std.ArrayList(i64)) !void {
         switch (self.*) {
@@ -306,10 +347,19 @@ fn takeFromMap(
 ) !void {
     var node = if (ascending) map.first() else map.last();
     while (node) |n| {
-        for (n.ids.ids.items) |id| {
-            try out.append(gpa, id);
-            if (out.items.len >= limit) return;
+        if (ascending) {
+            try n.ids.appendToLimit(gpa, out, limit);
+        } else {
+            var index = n.ids.ids.items.len;
+            while (index > 0) {
+                index -= 1;
+                const id = n.ids.ids.items[index];
+                if (id < 0) continue;
+                try out.append(gpa, id);
+                if (out.items.len >= limit) return;
+            }
         }
+        if (out.items.len >= limit) return;
         node = if (ascending) map.next(n) else map.prev(n);
     }
 }
@@ -421,6 +471,11 @@ pub fn wildcardMatch(pattern: []const u8, text: []const u8) bool {
 /// ASCII 小写复制（非 ASCII 字节原样保留；中文等 UTF-8 不受影响）。
 pub fn asciiLowerAlloc(gpa: std.mem.Allocator, text: []const u8) ![]u8 {
     const out = try gpa.alloc(u8, text.len);
+    return asciiLowerInto(out, text);
+}
+
+/// 把 `text` 折叠成 ASCII 小写写入 `out`（`out.len` 必须等于 `text.len`）。
+fn asciiLowerInto(out: []u8, text: []const u8) []u8 {
     for (text, 0..) |c, i| out[i] = std.ascii.toLower(c);
     return out;
 }
